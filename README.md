@@ -1,4 +1,7 @@
-# Meshtastic Listener & Scheduled Feedback
+<img width="1199" height="1312" alt="image" src="https://github.com/user-attachments/assets/ac5f9742-f8e1-461f-a1e1-f6f65018aa63" />
+
+# ButterBot
+# Mesthtastic Listener & Scheduled Feedback
 
 A Python service that listens for public Meshtastic text messages and periodically broadcasts a greeting, the local time, and a list of recently heard devices.
 
