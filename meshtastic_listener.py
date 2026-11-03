@@ -49,6 +49,7 @@ from pubsub import pub
 # America/Chicago automatically selects CST or CDT for each date.
 TIMEZONE = ZoneInfo("America/Chicago")
 
+# Set to None for automatic USB device detection.
 # USB serial device connected to the Meshtastic radio.
 #
 # None asks the Meshtastic library to detect the device automatically.
@@ -259,26 +260,16 @@ def open_database():
 
 
 def record_received(db):
-    """
-    Drain queued observations into persistent storage.
-
-    Duplicate packets do not advance the device's latest receipt
-    time. A newer, distinct text message updates its device record.
-    """
+    """Save queued observations and ignore duplicate packets."""
     while True:
         try:
-            # Nonblocking read: return to the main loop when no more
-            # observations are waiting.
             node_id, name, received, packet_id = RECEIVED.get_nowait()
         except queue.Empty:
             break
 
-        # Each observation is handled in a transaction. The context
-        # manager commits on success and rolls back on an exception.
         with db:
             if packet_id:
-                # INSERT OR IGNORE leaves an existing sender/packet-ID
-                # pair unchanged when that packet is observed again.
+                # Ignore a sender/packet-ID pair already recorded.
                 result = db.execute(
                     """
                     INSERT OR IGNORE INTO seen_packets
@@ -287,15 +278,10 @@ def record_received(db):
                     (node_id, packet_id, received),
                 )
 
-                # No inserted row means this packet was already seen.
                 if result.rowcount == 0:
                     continue
 
-            # Add a newly heard device or update an existing device.
-            # The WHERE clause prevents an older queued observation
-            # from replacing a newer receipt time.
-            #
-            # SQL parameters keep names and IDs out of SQL syntax.
+            # Retain each device's latest observation.
             db.execute(
                 """
                 INSERT INTO devices VALUES (?, ?, ?)
@@ -312,8 +298,6 @@ def record_received(db):
             name,
             node_id,
         )
-
-
 # ==================================================
 # Message formatting
 # ==================================================
@@ -409,9 +393,16 @@ def report_messages(db, now):
         # span multiple calendar days.
         timestamp = observed.strftime("%m/%d %I:%M %p %Z")
 
-        entry = (
-            f"- {clean_name(name)} ({node_id}) @ {timestamp}\n"
-        )
+        # Bound names by encoded bytes as well as characters. Emoji and
+        # other Unicode characters can otherwise overflow a report page.
+        suffix = f" ({node_id}) @ {timestamp}\n"
+        budget = MAX_TEXT_BYTES - len((header + "- " + suffix).encode("utf-8"))
+        if budget < 1:
+            raise ValueError("MAX_TEXT_BYTES is too small for a report entry")
+        display_name = clean_name(name).encode("utf-8")[:budget].decode(
+            "utf-8", errors="ignore"
+        ) or "?"
+        entry = f"- {display_name}{suffix}"
 
         # Measure encoded bytes, not Python character count.
         # Start another page before adding an entry that would
@@ -433,38 +424,34 @@ def report_messages(db, now):
 
 def send_if_due(db, interface):
     """
-    Submit a greeting and report when a scheduled time is reached.
+    Send a greeting and device report at scheduled Central times.
 
-    A scheduled slot is reserved before sending. If the process
-    stops halfway through, that slot is not automatically retried.
-    This favors avoiding duplicate public broadcasts over retrying
-    an incomplete report.
+    Reserve each scheduled slot before sending to prevent duplicate
+    broadcasts after a restart or partially completed transmission.
     """
     now = datetime.now(TIMEZONE)
 
-    # Return immediately outside a permitted broadcast minute.
+    # Only send during a configured hour and minute.
     if (
         now.hour not in ALLOWED_HOURS
         or now.minute != ALLOWED_MINUTE
     ):
         return
 
-    # The local date and scheduled minute identify this broadcast.
+    # Identify this scheduled broadcast by its local date and time.
     slot = now.strftime("%Y-%m-%d %H:%M")
 
-    # A reserved or completed slot must not be sent again.
+    # Skip slots that were already started or completed.
     if db.execute(
         "SELECT 1 FROM broadcasts WHERE slot = ?",
         (slot,),
     ).fetchone():
         return
 
-    # Generate a snapshot of the report at this scheduled time.
-    # New observations arriving during transmission are queued for
-    # storage afterward and are not added to this snapshot.
+    # Use the separate greeting function and report generator.
     messages = [greeting(now), *report_messages(db, now)]
 
-    # Persist the reservation before submitting the first message.
+    # Save the reservation before submitting any messages.
     with db:
         db.execute(
             "INSERT INTO broadcasts VALUES (?, 'started')",
@@ -472,26 +459,20 @@ def send_if_due(db, interface):
         )
 
     for index, message in enumerate(messages):
-        # Send the first message immediately. Wait before subsequent
-        # pages, while allowing a shutdown request to interrupt.
+        # Space messages apart. Allow shutdown during the wait.
         if index and STOP.wait(PAGE_DELAY_SECONDS):
             return
 
         if STOP.is_set():
             return
 
-        # Exit with an error if the library reported a lost link.
-        # systemd can then restart the application.
         if DISCONNECTED.is_set():
             raise ConnectionError(
                 "Meshtastic device disconnected"
             )
 
-        # Explicitly broadcast on the configured public channel.
-        # No individual destination acknowledgment is requested.
-        #
-        # A successful return means submission to the interface;
-        # it does not prove over-the-air delivery or reception.
+        # Submit each message to the configured public channel.
+        # Submission does not confirm reception by another node.
         interface.sendText(
             message,
             destinationId=meshtastic.BROADCAST_ADDR,
@@ -501,7 +482,7 @@ def send_if_due(db, interface):
 
         logging.info("Submitted broadcast: %s", message)
 
-    # Mark complete only after every message was submitted.
+    # All messages have been submitted to the interface.
     with db:
         db.execute(
             """
@@ -516,21 +497,16 @@ def send_if_due(db, interface):
         "Scheduled report submitted for %s",
         slot,
     )
-
-
 # ==================================================
 # Main
 # ==================================================
 
 def main():
-    """Initialize resources, listen continuously, and shut down cleanly."""
+    """Initialize the listener, process messages, and clean up on exit."""
 
-    # Create the data directory if it does not already exist.
     BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Keep the active log near 2 MB and retain three rotated copies.
-    # Log timestamps use the host's configured local timezone;
-    # broadcast timestamps explicitly use TIMEZONE.
+    # Rotate logs to prevent unlimited disk usage.
     handler = RotatingFileHandler(
         LOG_FILE,
         maxBytes=2_000_000,
@@ -543,119 +519,108 @@ def main():
         format="%(asctime)s %(levelname)s: %(message)s",
     )
 
-    # Hold this file open for the entire application lifetime.
-    # Linux releases the advisory lock when the descriptor closes
-    # or the process terminates, even after an unexpected exit.
-    lock_handle = LOCK_FILE.open("a")
+    # Keep the lock file open while the listener is running.
+    with LOCK_FILE.open("a") as lock_handle:
+        try:
+            fcntl.flock(
+                lock_handle.fileno(),
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except BlockingIOError:
+            raise RuntimeError(
+                "Another listener instance is running"
+            )
 
-    try:
-        fcntl.flock(
-            lock_handle.fileno(),
-            fcntl.LOCK_EX | fcntl.LOCK_NB,
-        )
-    except BlockingIOError:
-        raise RuntimeError(
-            "Another listener instance is running"
-        )
+        # Request a clean shutdown on Ctrl+C or a service stop.
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, lambda *_: STOP.set())
 
-    # SIGTERM is normally used by systemd to stop the service.
-    # SIGINT handles Ctrl+C during an interactive run.
-    # Set a flag rather than performing cleanup inside the handler.
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: STOP.set())
+        db = open_database()
+        interface = None
 
-    db = open_database()
-    interface = None
-
-    # Register callbacks before opening the connection so events
-    # emitted during connection setup can also be observed.
-    pub.subscribe(
-        on_receive,
-        "meshtastic.receive.text",
-    )
-    pub.subscribe(
-        on_disconnect,
-        "meshtastic.connection.lost",
-    )
-
-    try:
-        logging.info("Connecting to Meshtastic device")
-
-        interface = meshtastic.serial_interface.SerialInterface(
-            devPath=DEVICE_PORT
-        )
-
-        logging.info(
-            "Listener started on channel %s",
-            CHANNEL_INDEX,
-        )
-
-        while not STOP.is_set():
-            # Persist observations before generating any due report.
-            record_received(db)
-
-            if DISCONNECTED.is_set():
-                raise ConnectionError(
-                    "Meshtastic device disconnected"
-                )
-
-            # Usually returns immediately; sends only when due.
-            send_if_due(db, interface)
-
-            # Retain duplicate-packet history for seven days.
-            # This does not delete the separate device records.
-            with db:
-                db.execute(
-                    """
-                    DELETE FROM seen_packets
-                    WHERE received < ?
-                    """,
-                    (time.time() - 7 * 86400,),
-                )
-
-            # Wait approximately one second between checks.
-            # Event.wait returns early when shutdown is requested.
-            STOP.wait(1)
-
-    finally:
-        # Cleanup runs after normal shutdown and after exceptions.
-        # Stop accepting new callback observations first.
-        pub.unsubscribe(
+        # Register callbacks before connecting to the radio.
+        pub.subscribe(
             on_receive,
             "meshtastic.receive.text",
         )
-        pub.unsubscribe(
+        pub.subscribe(
             on_disconnect,
             "meshtastic.connection.lost",
         )
 
-        # Close the radio connection if initialization succeeded.
-        # Log a close failure without skipping subsequent cleanup.
-        if interface is not None:
-            try:
-                interface.close()
-            except Exception:
-                logging.exception(
-                    "Error closing interface"
+        try:
+            logging.info("Connecting to Meshtastic device")
+
+            interface = (
+                meshtastic.serial_interface.SerialInterface(
+                    devPath=DEVICE_PORT
                 )
+            )
 
-        # Save any observations still waiting in the queue.
-        record_received(db)
+            logging.info(
+                "Listener started on channel %s",
+                CHANNEL_INDEX,
+            )
 
-        db.close()
+            while not STOP.is_set():
+                # Save received observations before checking
+                # whether a scheduled report is due.
+                record_received(db)
 
-        # Closing the descriptor also releases the process lock.
-        lock_handle.close()
+                if DISCONNECTED.is_set():
+                    raise ConnectionError(
+                        "Meshtastic device disconnected"
+                    )
+
+                send_if_due(db, interface)
+
+                # Remove old duplicate-packet tracking records.
+                # Device receipt history is retained separately.
+                with db:
+                    db.execute(
+                        """
+                        DELETE FROM seen_packets
+                        WHERE received < ?
+                        """,
+                        (time.time() - 7 * 86400,),
+                    )
+
+                # Wait one second, or wake early for shutdown.
+                STOP.wait(1)
+
+        finally:
+            # Stop accepting new callback observations.
+            pub.unsubscribe(
+                on_receive,
+                "meshtastic.receive.text",
+            )
+            pub.unsubscribe(
+                on_disconnect,
+                "meshtastic.connection.lost",
+            )
+
+            if interface is not None:
+                try:
+                    interface.close()
+                except Exception:
+                    logging.exception(
+                        "Error closing interface"
+                    )
+
+            # Attempt to save pending observations, then close
+            # the database even if saving raises an exception.
+            try:
+                record_received(db)
+            finally:
+                db.close()
+
+    # Leaving the with block closes the lock file and releases
+    # the process lock automatically.
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception:
-        # Preserve the traceback and exit unsuccessfully.
-        # A systemd service configured with Restart=on-failure
-        # will restart the listener after this failure.
-        logging.exception(
-            "Listener stopped unexpectedly"
-        )
+        logging.exception("Listener stopped unexpectedly")
         raise
